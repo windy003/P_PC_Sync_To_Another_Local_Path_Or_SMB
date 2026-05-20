@@ -15,6 +15,7 @@ import time
 import shutil
 import fnmatch
 import logging
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -310,6 +311,173 @@ class SingleFileHandler(FileSystemEventHandler):
             logging.error("删除同步失败: %s", e)
 
 
+# --------------- .env 热重载 ---------------
+
+def _clear_sync_env_vars():
+    """清除当前进程中所有 SYNC_PAIR_* / SYNC_IGNORE 环境变量，便于重新加载。"""
+    for k in list(os.environ.keys()):
+        if k.startswith("SYNC_PAIR_") or k == "SYNC_IGNORE":
+            del os.environ[k]
+
+
+class EnvReloadHandler(FileSystemEventHandler):
+    """监听 .env 文件本身的变化，触发重载回调。"""
+    def __init__(self, env_path: Path, callback):
+        self.env_path = os.path.normpath(str(env_path))
+        self.callback = callback
+
+    def _is_env(self, path: str) -> bool:
+        return os.path.normpath(path) == self.env_path
+
+    def on_modified(self, event):
+        if not event.is_directory and self._is_env(event.src_path):
+            self.callback()
+
+    def on_created(self, event):
+        if not event.is_directory and self._is_env(event.src_path):
+            self.callback()
+
+    def on_moved(self, event):
+        if event.is_directory:
+            return
+        # 编辑器有时通过 "写临时文件 + 重命名" 完成保存
+        if self._is_env(event.src_path) or self._is_env(event.dest_path):
+            self.callback()
+
+
+class SyncManager:
+    """管理所有同步对的生命周期，支持 .env 修改后动态增删同步对。"""
+
+    def __init__(self, env_path: Path):
+        self.env_path = env_path
+        self.observer = Observer()
+        # pair_key -> (handler, ObservedWatch)
+        self.watches: dict[tuple, tuple] = {}
+        self._reload_timer: threading.Timer | None = None
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _pair_key(pair: SyncPair) -> tuple:
+        """同步对的唯一标识：source/dest/depth/ignore 任一变动即视为新对。"""
+        return (pair.source, pair.dest, pair.depth, tuple(sorted(pair.ignore)))
+
+    def _initial_sync(self, pair: SyncPair) -> bool:
+        if os.path.isfile(pair.source):
+            os.makedirs(pair.dest, exist_ok=True)
+            dst_file = os.path.join(pair.dest, os.path.basename(pair.source))
+            logging.info("同步文件: %s -> %s", pair.source, dst_file)
+            if not os.path.exists(dst_file) or os.stat(pair.source).st_mtime > os.stat(dst_file).st_mtime:
+                shutil.copy2(pair.source, dst_file)
+            return True
+        if os.path.isdir(pair.source):
+            os.makedirs(pair.dest, exist_ok=True)
+            depth_desc = "无限制" if pair.depth == 0 else str(pair.depth)
+            logging.info("同步对: %s -> %s [深度=%s, 忽略=%s]",
+                         pair.source, pair.dest, depth_desc, pair.ignore)
+            full_sync(pair)
+            return True
+        logging.error("源路径不存在: %s，已跳过", pair.source)
+        return False
+
+    def _schedule_pair(self, pair: SyncPair):
+        if os.path.isfile(pair.source):
+            handler = SingleFileHandler(pair.source, pair.dest)
+            watch = self.observer.schedule(handler, os.path.dirname(pair.source), recursive=False)
+        else:
+            handler = SyncHandler(pair)
+            watch = self.observer.schedule(handler, pair.source, recursive=True)
+        return handler, watch
+
+    def add_pair(self, pair: SyncPair):
+        key = self._pair_key(pair)
+        if key in self.watches:
+            return
+        if not self._initial_sync(pair):
+            return
+        try:
+            handler, watch = self._schedule_pair(pair)
+            self.watches[key] = (handler, watch)
+            logging.info("[已添加] %s -> %s", pair.source, pair.dest)
+        except Exception as e:
+            logging.error("添加同步对失败 %s: %s", pair.source, e)
+
+    def remove_pair(self, key: tuple):
+        entry = self.watches.pop(key, None)
+        if entry is None:
+            return
+        handler, watch = entry
+        try:
+            # 仅移除该 handler，不影响共享同一 watch 路径的其他 handler
+            self.observer.remove_handler_for_watch(handler, watch)
+            logging.info("[已移除] %s -> %s", key[0], key[1])
+        except Exception as e:
+            logging.error("移除同步对失败: %s", e)
+
+    def _reload(self):
+        with self._lock:
+            self._reload_timer = None
+            _clear_sync_env_vars()
+            try:
+                _load_env_raw(self.env_path)
+            except Exception as e:
+                logging.error("重新加载 .env 失败: %s", e)
+                return
+
+            new_pairs = load_sync_pairs()
+            new_map = {self._pair_key(p): p for p in new_pairs}
+            old_keys = set(self.watches.keys())
+            new_keys = set(new_map.keys())
+
+            # 同步日志级别（如果 .env 改了 SYNC_LOG_LEVEL）
+            log_level = os.getenv("SYNC_LOG_LEVEL", "INFO").upper()
+            logging.getLogger().setLevel(getattr(logging, log_level, logging.INFO))
+
+            if new_keys == old_keys:
+                logging.info("[.env 重载] 配置无变化")
+                return
+
+            logging.info("[.env 重载] 应用新配置...")
+            for key in old_keys - new_keys:
+                self.remove_pair(key)
+            for key in new_keys - old_keys:
+                self.add_pair(new_map[key])
+            logging.info("[.env 重载完成] 当前同步对数量: %d", len(self.watches))
+
+    def schedule_reload(self):
+        """防抖：1 秒内多次 .env 修改事件合并为一次重载。"""
+        with self._lock:
+            if self._reload_timer is not None:
+                self._reload_timer.cancel()
+            self._reload_timer = threading.Timer(1.0, self._reload)
+            self._reload_timer.daemon = True
+            self._reload_timer.start()
+
+    def start(self):
+        pairs = load_sync_pairs()
+        if not pairs:
+            logging.error("未在 .env 中找到任何同步对，程序退出。")
+            sys.exit(1)
+
+        logging.info("正在执行初始全量同步...")
+        for pair in pairs:
+            self.add_pair(pair)
+
+        # 监听 .env 自身（监听其所在目录，handler 内做文件名过滤）
+        env_handler = EnvReloadHandler(self.env_path, self.schedule_reload)
+        self.observer.schedule(env_handler, str(self.env_path.parent), recursive=False)
+
+        self.observer.start()
+        logging.info("正在监听 %d 个同步对，并监听 .env 变化，按 Ctrl+C 停止。", len(self.watches))
+
+    def stop(self):
+        with self._lock:
+            if self._reload_timer is not None:
+                self._reload_timer.cancel()
+                self._reload_timer = None
+        self.observer.stop()
+        self.observer.join()
+
+
 # --------------- 主程序 ---------------
 
 def main():
@@ -320,57 +488,16 @@ def main():
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    pairs = load_sync_pairs()
-    if not pairs:
-        logging.error("未在 .env 中找到任何同步对，程序退出。")
-        sys.exit(1)
-
-    observer = Observer()
-
-    for pair in pairs:
-        is_file_source = os.path.isfile(pair.source)
-
-        if is_file_source:
-            # 源是单个文件：直接复制到目标目录
-            os.makedirs(pair.dest, exist_ok=True)
-            dst_file = os.path.join(pair.dest, os.path.basename(pair.source))
-            logging.info("同步文件: %s -> %s", pair.source, dst_file)
-            logging.info("正在执行初始同步...")
-            if not os.path.exists(dst_file) or os.stat(pair.source).st_mtime > os.stat(dst_file).st_mtime:
-                shutil.copy2(pair.source, dst_file)
-                logging.debug("已复制: %s -> %s", pair.source, dst_file)
-        elif os.path.isdir(pair.source):
-            os.makedirs(pair.dest, exist_ok=True)
-            depth_desc = "无限制" if pair.depth == 0 else str(pair.depth)
-            logging.info("同步对: %s -> %s [深度=%s, 忽略=%s]",
-                         pair.source, pair.dest, depth_desc, pair.ignore)
-            logging.info("正在执行初始全量同步...")
-            full_sync(pair)
-        else:
-            logging.error("源路径不存在: %s，已跳过", pair.source)
-            continue
-
-    for pair in pairs:
-        is_file_source = os.path.isfile(pair.source)
-        if is_file_source:
-            # 监听文件所在的目录，通过 handler 过滤只关注该文件
-            watch_dir = os.path.dirname(pair.source)
-            handler = SingleFileHandler(pair.source, pair.dest)
-            observer.schedule(handler, watch_dir, recursive=False)
-        else:
-            handler = SyncHandler(pair)
-            observer.schedule(handler, pair.source, recursive=True)
-
-    observer.start()
-    logging.info("正在监听 %d 个同步对，按 Ctrl+C 停止。", len(pairs))
+    env_path = Path(__file__).parent / ".env"
+    manager = SyncManager(env_path)
+    manager.start()
 
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         logging.info("正在停止...")
-        observer.stop()
-    observer.join()
+        manager.stop()
 
 
 if __name__ == "__main__":
