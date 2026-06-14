@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "PowerShell(python -c \"import ast; ast.parse\\(open\\('sync.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
+      "PowerShell(python -c \"import ast; ast.parse\\(open\\('sync.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -m py_compile Sync_To_Local_Or_SMB.py)"
     ]
   }
 }

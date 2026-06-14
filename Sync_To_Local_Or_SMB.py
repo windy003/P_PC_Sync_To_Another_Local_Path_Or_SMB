@@ -273,42 +273,88 @@ class SyncHandler(FileSystemEventHandler):
 
 
 class SingleFileHandler(FileSystemEventHandler):
-    """监听单个文件的变化，将其同步到目标目录。"""
+    """监听单个文件的变化，将其同步到目标目录。
+
+    针对"被程序频繁重写"的文件（如输入法词典）做了三点加固：
+      1. 处理 on_moved —— 编辑器/输入法常用"写临时文件 + 改名覆盖"保存，
+         这会触发 moved 而非 modified，旧实现会漏掉。
+      2. 防抖 —— 连续事件合并，延迟后再复制，避开写入中途。
+      3. 大小校验 + 重试 —— 避免把写到一半的残缺/空文件复制到目标。
+    """
+    _DEBOUNCE_SEC = 0.4
+    _RETRY = 5
+    _RETRY_WAIT = 0.3
+
     def __init__(self, src_file: str, dst_dir: str):
         self.src_file = os.path.normpath(src_file)
         self.dst_dir = dst_dir
         self.dst_file = os.path.join(dst_dir, os.path.basename(src_file))
+        self._timer: threading.Timer | None = None
+        self._lock = threading.Lock()
 
     def _is_target(self, path: str) -> bool:
         return os.path.normpath(path) == self.src_file
 
-    def on_modified(self, event):
-        if event.is_directory or not self._is_target(event.src_path):
-            return
-        try:
-            shutil.copy2(self.src_file, self.dst_file)
-            logging.info("[修改文件] %s -> %s", self.src_file, self.dst_file)
-        except Exception as e:
-            logging.error("修改同步失败: %s", e)
+    def _schedule_copy(self):
+        """防抖：连续事件合并为一次，延迟后再复制。"""
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+            self._timer = threading.Timer(self._DEBOUNCE_SEC, self._do_copy)
+            self._timer.daemon = True
+            self._timer.start()
 
-    def on_created(self, event):
-        if event.is_directory or not self._is_target(event.src_path):
-            return
-        try:
-            shutil.copy2(self.src_file, self.dst_file)
-            logging.info("[创建文件] %s -> %s", self.src_file, self.dst_file)
-        except Exception as e:
-            logging.error("创建同步失败: %s", e)
+    def _do_copy(self):
+        with self._lock:
+            self._timer = None
+        # 源文件可能正被占用或写入中途，重试若干次并校验大小一致
+        for attempt in range(1, self._RETRY + 1):
+            try:
+                if not os.path.exists(self.src_file):
+                    return
+                os.makedirs(self.dst_dir, exist_ok=True)
+                shutil.copy2(self.src_file, self.dst_file)
+                if os.path.getsize(self.src_file) == os.path.getsize(self.dst_file):
+                    logging.info("[同步文件] %s -> %s", self.src_file, self.dst_file)
+                    return
+                logging.warning("文件大小不一致（可能写入中途），重试: %s", self.src_file)
+            except Exception as e:
+                logging.warning("同步文件失败（第 %d 次）: %s", attempt, e)
+            time.sleep(self._RETRY_WAIT)
+        logging.error("同步文件最终失败: %s", self.src_file)
 
-    def on_deleted(self, event):
-        if event.is_directory or not self._is_target(event.src_path):
-            return
+    def _do_delete(self):
         try:
             if os.path.exists(self.dst_file):
                 os.remove(self.dst_file)
                 logging.info("[删除文件] %s", self.dst_file)
         except Exception as e:
             logging.error("删除同步失败: %s", e)
+
+    def on_modified(self, event):
+        if event.is_directory or not self._is_target(event.src_path):
+            return
+        self._schedule_copy()
+
+    def on_created(self, event):
+        if event.is_directory or not self._is_target(event.src_path):
+            return
+        self._schedule_copy()
+
+    def on_moved(self, event):
+        if event.is_directory:
+            return
+        # 原子保存：临时文件被改名覆盖到源文件路径
+        if self._is_target(event.dest_path):
+            self._schedule_copy()
+        # 源文件被改名移走，视为删除
+        elif self._is_target(event.src_path):
+            self._do_delete()
+
+    def on_deleted(self, event):
+        if event.is_directory or not self._is_target(event.src_path):
+            return
+        self._do_delete()
 
 
 # --------------- .env 热重载 ---------------
